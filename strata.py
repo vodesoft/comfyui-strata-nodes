@@ -356,10 +356,14 @@ def _wait_loaded(proc: subprocess.Popen, port: int, timeout: float) -> dict:
 
 
 def _chat(port: int, messages: list, max_tokens: int, effort: str,
-          timeout: float, api_key: str = "") -> tuple[str, str, dict]:
+            timeout: float, api_key: str = "", sampling: dict | None = None) -> tuple[str, str, dict]:
     """One non-streamed /v1/chat/completions call. Returns (content, reasoning, usage)."""
     body = {"model": "strata", "messages": messages, "max_tokens": int(max_tokens),
             "reasoning_effort": effort, "stream": False}
+    # the server reads these straight off the request and merges them over the values from
+    # strata-<model>.json (serve/server.py: sampling = {**defaults, **req_values}), so only
+    # the fields the node was given are sent
+    body.update(sampling or {})
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -462,12 +466,33 @@ class StrataRun:
                                             "tooltip": "Seconds to wait for the model to load "
                                                        "(first load is slowest)."}),
                 "prompt_timeout": ("INT", {"default": 1800, "min": 60, "max": 7200}),
+                # sampling: -1 means "keep whatever strata-<model>.json chose" (the field is
+                # then not sent at all); the server merges what is sent over its own defaults
+                "temperature": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                          "tooltip": "Sampling temperature (config default 1.0); -1 keeps the config value."}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": -1.0, "max": 1.0, "step": 0.01,
+                                    "tooltip": "Nucleus sampling (config default 0.95); -1 keeps the config value."}),
+                "top_k": ("INT", {"default": 20, "min": -1, "max": 64,
+                                  "tooltip": "Top-k candidates, engine caps at 64 (config default 20); -1 keeps the config value."}),
+                "min_p": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                    "tooltip": "Min-p sampling (config default 0.0); -1 keeps the config value."}),
+                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                               "tooltip": "Penalise tokens already present (config default 0.0); -1 keeps the config value."}),
+                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                                "tooltip": "Penalise tokens by how often they already appear (config default 0.0); -1 keeps the config value."}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": -1.0, "max": 2.0, "step": 0.05,
+                                                 "tooltip": "Penalise any token seen in the last window (config default 1.05); -1 keeps the config value."}),
+                "penalty_last_n": ("INT", {"default": 512, "min": -1, "max": 8192,
+                                           "tooltip": "How many past tokens the penalties look at (default 512; the config uses 64); -1 keeps the config value."}),
                 "unload_after": ("BOOLEAN", {"default": True,
                                              "tooltip": "Stop the server and free VRAM/RAM when "
                                                         "the prompt finishes."}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff,
-                                 "tooltip": "Non-zero reuses the cached result instead of "
-                                            "loading the model again."}),
+                                 "tooltip": "Non-zero reuses the cached result instead of loading "
+                                            "the model again; it is also the engine's sampling seed."}),
+                "bypass": ("BOOLEAN", {"default": False,
+                                       "tooltip": "Pass the prompt straight through to the result: "
+                                                  "Strata is not read, started, stopped or touched at all."}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Optional image for the prompt (needs vision "
@@ -488,7 +513,13 @@ class StrataRun:
     SIZE_HINTS = ("large",)
 
     def _run(self, folder, prompt, system, image, max_tokens, effort,
-             startup_timeout, prompt_timeout, unload, seed, port):
+             startup_timeout, prompt_timeout, unload, seed, port,
+             temperature=-1.0, top_p=-1.0, top_k=-1, min_p=-1.0,
+             presence_penalty=-1.0, frequency_penalty=-1.0, repetition_penalty=-1.0,
+             penalty_last_n=-1, bypass=False):
+        if bypass:
+            # the switch is on: the prompt is the result, nothing of Strata is even read
+            return (prompt or "", "", json.dumps({"bypass": True, "seconds": 0.0}, indent=2))
         if not (folder or "").strip():
             raise ValueError("the Strata folder path is empty")
         cfg = _load_config(folder)
@@ -514,6 +545,18 @@ class StrataRun:
             messages.append({"role": "user", "content": (prompt or "").strip()})
         if not (prompt or "").strip() and not part:
             raise ValueError("the prompt is empty")
+        # -1 in a sampling widget means "leave the config value alone": the field is not sent,
+        # so serve/server.py keeps strata-<model>.json's own number for it
+        want_sampling = {}
+        for key, value in (("temperature", temperature), ("top_p", top_p), ("top_k", top_k),
+                           ("min_p", min_p), ("presence_penalty", presence_penalty),
+                           ("frequency_penalty", frequency_penalty),
+                           ("repetition_penalty", repetition_penalty),
+                           ("penalty_last_n", penalty_last_n)):
+            if value is not None and float(value) >= 0:
+                want_sampling[key] = int(value) if key in ("top_k", "penalty_last_n") else float(value)
+        if seed:
+            want_sampling["seed"] = int(seed)
         stopped = _stop_existing(port, cfg["_root"])
         t0 = time.time()
         proc = _spawn(cfg, port)
@@ -521,7 +564,7 @@ class StrataRun:
             info = _wait_loaded(proc, port, float(startup_timeout))
             api_key = str(info.get("api_key") or "")
             content, reasoning, usage = _chat(port, messages, int(max_tokens), effort,
-                                              float(prompt_timeout), api_key)
+                                              float(prompt_timeout), api_key, want_sampling)
         finally:
             state = (_stop_server(proc, port, 180.0, cfg["_root"]) if unload
                      else "left running")
@@ -531,16 +574,26 @@ class StrataRun:
         return (content, reasoning, json.dumps(meta, indent=2))
 
     def execute(self, folder: str, port: int, prompt: str, system: str = "",
-                max_tokens: int = 4096, thinking: str = "config",
-                startup_timeout: int = 900, prompt_timeout: int = 1800,
-                unload_after: bool = True, seed: int = 0, image=None):
-        key = (folder, prompt, system, max_tokens, thinking, image is not None,
-               port, startup_timeout, prompt_timeout, unload_after, seed)
+              max_tokens: int = 4096, thinking: str = "config",
+              startup_timeout: int = 900, prompt_timeout: int = 1800,
+              temperature: float = 1.0, top_p: float = 0.95, top_k: int = 20, min_p: float = 0.0,
+              presence_penalty: float = 0.0, frequency_penalty: float = 0.0,
+              repetition_penalty: float = 1.05, penalty_last_n: int = 512,
+              unload_after: bool = True, seed: int = 0, bypass: bool = False, image=None):
+        # the order here must match INPUT_TYPES exactly: ComfyUI calls this positionally, so
+        # the eight sampling widgets sit between prompt_timeout and unload_after; bypass is a
+        # required widget just before the only optional input (image), which must stay last
+        key = (folder, prompt, system, max_tokens, thinking, image is not None, port,
+               startup_timeout, prompt_timeout, unload_after, seed, bypass,
+               temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty,
+               repetition_penalty, penalty_last_n)
         if seed and key in self.cache:
             return self.cache[key]
         out = self._run(folder, prompt, system, image, max_tokens,
-                        "" if thinking == "config" else thinking,
-                        startup_timeout, prompt_timeout, unload_after, seed, port)
+                        "" if thinking == "config" else thinking, startup_timeout,
+                        prompt_timeout, unload_after, seed, port, temperature, top_p, top_k,
+                        min_p, presence_penalty, frequency_penalty, repetition_penalty,
+                        penalty_last_n, bypass)
         self.cache = {key: out}
         return out
 

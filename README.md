@@ -28,8 +28,20 @@ it).
 | `thinking` | `config` | `config` keeps the value from `strata-<model>.json`, or force `none/low/medium/high` |
 | `startup_timeout` | 900 | seconds to wait for the model to load (first load is slowest) |
 | `prompt_timeout` | 1800 | seconds for the completion request |
+| `temperature` | 1.0 | sampling temperature (0..2); default mirrors the current config, `-1` keeps whatever `strata-<model>.json` says |
+| `top_p` | 0.95 | nucleus sampling (0..1); default mirrors the config, `-1` keeps it |
+| `top_k` | 20 | top-k candidates (the engine caps this at 64); default mirrors the config, `-1` keeps it |
+| `min_p` | 0.0 | min-p sampling (0..1); default mirrors the config, `-1` keeps it |
+| `presence_penalty` | 0.0 | penalise tokens already present, curbs loops and repeated refusals; default mirrors the config (`-1` keeps it) |
+| `frequency_penalty` | 0.0 | penalise tokens by how often they appear; default mirrors the config (`-1` keeps it) |
+| `repetition_penalty` | 1.05 | penalise any token seen in the last window; default mirrors the config (`-1` keeps it) |
+| `penalty_last_n` | 512 | how many past tokens the penalties look at; default widened to 512 (the config uses 64), `-1` keeps the config value |
 | `unload_after` | `true` | stop the server and free VRAM/RAM when the prompt finishes |
 | `seed` | 0 | non-zero reuses the cached result instead of loading the model again |
+| `bypass` | `false` | when `true` the node does nothing with Strata at all: it never reads the folder, never touches the port or the GPU, and simply returns the prompt as `result` (empty `reasoning`, `run info` = `{"bypass": true}`) |
+
+The only optional input is `image` (an IMAGE for a vision prompt; needs `vision` in the Strata
+config) and it may be left disconnected.
 
 ### StrataRun outputs
 
