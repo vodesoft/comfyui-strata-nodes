@@ -152,3 +152,9 @@ Stderr of the spawned server goes to `_comfynode-<port>.log` inside the Strata f
   minutes). Use `seed` non-zero to keep the first result and skip the reload.
 - Set `unload_after` to `false` only when nothing else needs the GPU afterwards; the node
   still ends the process at graph completion unless you do that yourself.
+
+## License
+
+This pack (the two node files and its docs) is MIT licensed - see `LICENSE`. It covers this repo
+only: Strata itself, its engine packages and the model weights all belong to upstream and keep
+their own terms, so re-check those before redistributing a bundle that includes them.
