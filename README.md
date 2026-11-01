@@ -8,6 +8,53 @@ No server flags to learn and no second copy of the model - point the node at the
 that already holds your configured Strata install (the one with `strata-<model>.json` in
 it).
 
+## Installation
+
+Drop the pack into ComfyUI's `custom_nodes`, nothing else to install:
+
+```text
+ComfyUI/custom_nodes/
+    comfyui-strata-nodes/
+        __init__.py
+        strata.py
+```
+
+Restart ComfyUI; the nodes appear as `Strata Run (start / prompt / stop)` and `Strata Config`.
+
+- No `requirements.txt` and no pip step. Every import in `strata.py` is stdlib; the only
+  non-stdlib names (`numpy`, `Pillow` behind the optional `image` input, `psutil` for the
+  process scan) already ship with ComfyUI, and each one is guarded or has a fallback.
+- No download of weights or engines here - Strata owns that, see below.
+- Windows in practice: the node reads `run-<model>.bat` and stops processes through
+  `netstat -ano`, `tasklist` and `taskkill /T`. A `setup.sh` install has no `.bat` to read
+  and no `taskkill`, so its start/stop cycle is not what this node was written for.
+
+### Which Strata build this works with
+
+The **Terminal / source install** of Strata, not the desktop app. The node drives it through
+the files setup writes next to the model folder - `strata-<model>.json` (engine exe and args,
+cwd, tokenizer, port, sampling, vision) plus `run-<model>.bat` (the exact start command) - and
+spawns `serve/server.py` itself. The app keeps its run settings in its own state under
+`%LOCALAPPDATA%\Strata\` (components and install folders) rather than next to the weights, so
+pointing `folder` at a models library the app filled in finds no config - `_load_config` raises
+before anything touches the GPU.
+
+Prepare a folder once with setup, non-interactively, then point `folder` at it:
+
+```bat
+cd /d D:\AI\models\Strata
+START-HERE.bat --family qwen --model Q2_0 --yes
+```
+
+That leaves `strata-Q2_0.json` and `run-Q2_0.bat` in the same folder, which is exactly what the
+node needs. Pick a pack that fits your machine - `Q2_0` is an example size, not a minimum.
+
+What Strata itself requires (Python deps, `.venv`, engine package for your card, GPU and driver
+rules, model sizes) belongs to upstream, not to this pack: see the [Niko1221/Strata](https://github.com/Niko1221/Strata)
+repo - `docs/INSTALL.md` (Terminal vs app), `docs/TERMINAL_LAUNCH.md` (`strata launch`, flags,
+presets) and `docs/SOURCE_INSTALL.md` (the checkout route that writes the `.json` / `.bat` files).
+Strata's own `requirements.txt` lives there; this pack adds nothing to it.
+
 ## Nodes
 
 | Node | Purpose |
