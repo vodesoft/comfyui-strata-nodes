@@ -22,8 +22,11 @@ ComfyUI/custom_nodes/
 Restart ComfyUI; the nodes appear as `Strata Run (start / prompt / stop)` and `Strata Config`.
 
 - No `requirements.txt` and no pip step. Every import in `strata.py` is stdlib; the only
-  non-stdlib names (`numpy`, `Pillow` behind the optional `image` input, `psutil` for the
+  non-stdlib names (`numpy`, `Pillow` behind the picture inputs, `psutil` for the
   process scan) already ship with ComfyUI, and each one is guarded or has a fallback.
+- The nodes use ComfyUI's V3 node API (`comfy_api.latest`), so the host needs to be recent
+  enough to have it - the same requirement as `LLMTextProcessorVL` in
+  `ComfyUI-LLM-text-processor`.
 - No download of weights or engines here - Strata owns that, see below.
 - Windows in practice: the node reads `run-<model>.bat` and stops processes through
   `netstat -ano`, `tasklist` and `taskkill /T`. A `setup.sh` install has no `.bat` to read
@@ -70,7 +73,10 @@ Strata's own `requirements.txt` lives there; this pack adds nothing to it.
 | `port` | 8080 | the port to own (1..65535). Whatever Strata server already listens there gets stopped first, then the node starts its own on that same port. Leave it at 8080 and the port from `strata-<model>.json` is used instead - any other number overrides the config |
 | `prompt` | - | the request |
 | `system` | `""` | optional system message |
-| `image` | off | optional IMAGE; needs `vision` in the Strata config |
+| `ref_images` | off | a growing group of picture sockets, `ref_image_0..ref_image_8`, same names and order as `LLMTextProcessorVL`; each socket may itself be a batch (B,H,W,C) - every frame becomes its own Picture |
+| `first_frame` | off | an IMAGE that is sent only when `also_ref_first_frame` is on, appended after the refs so it takes the next Picture ordinal |
+| `last_frame` | off | keyframe pin; accepted for layout parity and never sent to Strata |
+| `also_ref_first_frame` | `false` | expose `first_frame` as the next Picture reference |
 | `max_tokens` | 4096 | 1..131072 |
 | `thinking` | `config` | `config` keeps the value from `strata-<model>.json`, or force `none/low/medium/high` |
 | `startup_timeout` | 900 | seconds to wait for the model to load (first load is slowest) |
@@ -87,8 +93,12 @@ Strata's own `requirements.txt` lives there; this pack adds nothing to it.
 | `seed` | 0 | non-zero reuses the cached result instead of loading the model again |
 | `bypass` | `false` | when `true` the node does nothing with Strata at all: it never reads the folder, never touches the port or the GPU, and simply returns the prompt as `result` (empty `reasoning`, `run info` = `{"bypass": true}`) |
 
-The only optional input is `image` (an IMAGE for a vision prompt; needs `vision` in the Strata
-config) and it may be left disconnected.
+All picture sockets are optional and may stay disconnected - with none connected the node sends
+a plain text message, exactly as before. With pictures connected, they go out as ordered
+`image_url` parts ahead of the prompt text, one part per picture, in socket order; Strata reads
+image parts only (it has no audio or video part type), so `ref_videos` / `ref_audios` sockets from
+the VL node have no counterpart here. The vision guard still applies: connecting any picture to a
+Strata install without `vision` in its config raises before anything is started.
 
 ### StrataRun outputs
 
@@ -96,6 +106,7 @@ config) and it may be left disconnected.
 2. `reasoning` - `reasoning_content` when the model emits it, otherwise empty
 3. `run info` - JSON: model, port, seconds, unload state, token usage
   plus `stopped_existing_server` (`true` when a server you were running outside ComfyUI had to be shut down first)
+  and `pictures` (how many image parts went out)
 
 ## Lifecycle
 
@@ -134,6 +145,9 @@ Stderr of the spawned server goes to `_comfynode-<port>.log` inside the Strata f
 
 - Requires the ComfyUI process and Strata to share one machine; the node talks only to
   `127.0.0.1:<port>` - the `port` input, or the port from the config when you leave it alone.
+- The pack registers through `comfy_entrypoint`, so both nodes appear once ComfyUI restarts;
+  nothing is started at import time - a Strata instance you are already running elsewhere stays
+  untouched until a `StrataRun` actually executes.
 - If a ComfyUI workflow runs several times, each run reloads the model (tens of seconds to
   minutes). Use `seed` non-zero to keep the first result and skip the reload.
 - Set `unload_after` to `false` only when nothing else needs the GPU afterwards; the node

@@ -9,18 +9,21 @@ time (loading it pins tens of GB), so the node owns the whole lifecycle:
     2. read <strata_dir>/run-<model>.bat       (the exact start command setup wrote)
     3. if something already listens on that port, stop it gracefully first
     4. spawn the server, poll /health until "loaded": true
-    5. POST /v1/chat/completions with the prompt (image part optional)
+    5. POST /v1/chat/completions with the prompt (picture parts optional, in socket order)
     6. stop the server: SIGTERM/terminate -> the server sends QUIT to its engine child
        and frees VRAM/RAM; force-kill only if it refuses to end
 
 Nodes:
-    StrataRun      prompt in, text + reasoning + run metadata out
+    StrataRun      prompt + media references in, text + reasoning + run metadata out
     StrataInspect  a folder path in, the parsed config / start command out
 """
 
 from __future__ import annotations
 
+from comfy_api.latest import ComfyExtension, io
+
 import glob
+import hashlib
 import json
 import os
 import re
@@ -415,7 +418,10 @@ def _stop_server(proc: subprocess.Popen, port: int, timeout: float, root: str = 
 
 
 def _image_part(image) -> dict:
-    """A ComfyUI IMAGE tensor to Strata's OpenAI image_url part."""
+    """One ComfyUI IMAGE (a single H,W,C frame) to Strata's OpenAI image_url part.
+
+    A batch goes through `_picture_parts` instead, which makes one part per frame so the
+    model sees every picture separately, like the reference layout does."""
     import base64
     import io
     import numpy as np
@@ -438,81 +444,147 @@ def _image_part(image) -> dict:
                            + base64.b64encode(out.getvalue()).decode()}}
 
 
-class StrataRun:
-    def __init__(self):
-        self.cache = {}
+def _picture_parts(images) -> list[dict]:
+    """Connected pictures to ordered OpenAI image parts.
 
-    def INPUT_TYPES(s=None):
-        return {
-            "required": {
-                "folder": ("STRING", {"multiline": False,
-                                      "tooltip": "The configured Strata folder (the one "
-                                                 "holding strata-<model>.json)."}),
-                                "port": ("INT", {"default": 8080, "min": 1, "max": 65535,
-                                                  "tooltip": "The port to own. Any Strata server already "
-                                                             "listening here is stopped first, then the node "
-                                                             "starts its own on this same port."}),
-                "prompt": ("STRING", {"multiline": True, "tooltip": "The prompt to execute."}),
-                "system": ("STRING", {"multiline": True, "default": "",
-                                      "tooltip": "Optional system message."}),
-                "max_tokens": ("INT", {"default": 4096, "min": 1, "max": 131072}),
-                # a list as the type is what makes the classic UI draw a dropdown (same
-                # as KSampler's sampler_name/scheduler); "choices" on a STRING is ignored
-                "thinking": (["config", "none", "low", "medium", "high"],
-                             {"default": "config",
-                              "tooltip": "Reasoning effort; 'config' keeps whatever the "
-                                         "Strata config chose."}),
-                "startup_timeout": ("INT", {"default": 900, "min": 30, "max": 7200,
-                                            "tooltip": "Seconds to wait for the model to load "
-                                                       "(first load is slowest)."}),
-                "prompt_timeout": ("INT", {"default": 1800, "min": 60, "max": 7200}),
-                # sampling: -1 means "keep whatever strata-<model>.json chose" (the field is
-                # then not sent at all); the server merges what is sent over its own defaults
-                "temperature": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                                          "tooltip": "Sampling temperature (config default 1.0); -1 keeps the config value."}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": -1.0, "max": 1.0, "step": 0.01,
-                                    "tooltip": "Nucleus sampling (config default 0.95); -1 keeps the config value."}),
-                "top_k": ("INT", {"default": 20, "min": -1, "max": 64,
-                                  "tooltip": "Top-k candidates, engine caps at 64 (config default 20); -1 keeps the config value."}),
-                "min_p": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
-                                    "tooltip": "Min-p sampling (config default 0.0); -1 keeps the config value."}),
-                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                                               "tooltip": "Penalise tokens already present (config default 0.0); -1 keeps the config value."}),
-                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                                                "tooltip": "Penalise tokens by how often they already appear (config default 0.0); -1 keeps the config value."}),
-                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": -1.0, "max": 2.0, "step": 0.05,
-                                                 "tooltip": "Penalise any token seen in the last window (config default 1.05); -1 keeps the config value."}),
-                "penalty_last_n": ("INT", {"default": 512, "min": -1, "max": 8192,
-                                           "tooltip": "How many past tokens the penalties look at (default 512; the config uses 64); -1 keeps the config value."}),
-                "unload_after": ("BOOLEAN", {"default": True,
-                                             "tooltip": "Stop the server and free VRAM/RAM when "
-                                                        "the prompt finishes."}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff,
-                                 "tooltip": "Non-zero reuses the cached result instead of loading "
-                                            "the model again; it is also the engine's sampling seed."}),
-                "bypass": ("BOOLEAN", {"default": False,
-                                       "tooltip": "Pass the prompt straight through to the result: "
-                                                  "Strata is not read, started, stopped or touched at all."}),
-            },
-            "optional": {
-                "image": ("IMAGE", {"tooltip": "Optional image for the prompt (needs vision "
-                                               "enabled in the Strata config)."}),
-            },
-        }
+    Each connected input may itself be a batch (B,H,W,C): every frame becomes its own part,
+    so the server renders one vision block per picture in exactly this order."""
+    out: list[dict] = []
+    for image in images:
+        if image is None:
+            continue
+        if getattr(image, "ndim", 3) == 4:      # a batch of frames -> one part each
+            out.extend(_image_part(frame) for frame in image)
+        else:
+            out.append(_image_part(image))
+    return out
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("result", "reasoning", "run info")
-    FUNCTION = "execute"
-    DESCRIPTION = ("Owns one port: a server already listening there is found in the process "
-                   "list and terminated with its whole launcher chain (model unloaded first), "
-                   "the engine is loaded from scratch on the same port, the prompt runs, then "
-                   "this server is stopped and VRAM/RAM are freed. Nothing is loaded when the "
-                   "port could not be freed first - the run fails instead of stacking a second "
-                   "model in memory.")
-    CATEGORY = "LLM/Strata"
-    SIZE_HINTS = ("large",)
 
-    def _run(self, folder, prompt, system, image, max_tokens, effort,
+# The result cache lives here rather than on the node object: new-API nodes are class-based,
+# so there is no instance to hang state on. One entry at a time, like the old node kept.
+_RESULT_CACHE: dict = {}
+
+
+def _media_digest(pictures) -> tuple:
+    """A small fingerprint of connected pictures for the result cache.
+
+    Same shape plus a content hash per picture, so a cached answer is only reused when the very
+    same tensors come in - counting sockets alone would reuse it after the workflow swapped one
+    picture for another."""
+    import numpy as np
+
+    out = []
+    for image in pictures:
+        if image is None:
+            continue
+        a = image.detach().cpu().numpy() if hasattr(image, "detach") else np.asarray(image)
+        a = np.ascontiguousarray(a)
+        out.append((a.shape, a.dtype.str, hashlib.sha1(a.tobytes()).hexdigest()))
+    return tuple(out)
+
+
+class StrataRun(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="StrataRun",
+            display_name="Strata Run (start / prompt / stop)",
+            description=("Owns one port: a server already listening there is found in the process "
+                         "list and terminated with its whole launcher chain (model unloaded first), "
+                         "the engine is loaded from scratch on the same port, the prompt runs, then "
+                         "this server is stopped and VRAM/RAM are freed. Nothing is loaded when the "
+                         "port could not be freed first - the run fails instead of stacking a second "
+                         "model in memory."),
+            category="LLM/Strata",
+            inputs=[
+                io.String.Input("folder", multiline=False,
+                                tooltip="The configured Strata folder (the one holding "
+                                       "strata-<model>.json)."),
+                io.Int.Input("port", default=8080, min=1, max=65535,
+                             tooltip="The port to own. Any Strata server already listening here is "
+                                     "stopped first, then the node starts its own on this same port."),
+                io.String.Input("prompt", multiline=True, dynamic_prompts=True,
+                                tooltip="The prompt to execute."),
+                io.String.Input("system", multiline=True, default="", dynamic_prompts=True,
+                                tooltip="Optional system message."),
+                io.Int.Input("max_tokens", default=4096, min=1, max=131072),
+                # a Combo is what draws the dropdown in both UIs; 'config' keeps the config's own effort
+                io.Combo.Input("thinking", options=["config", "none", "low", "medium", "high"],
+                               default="config",
+                               tooltip="Reasoning effort; 'config' keeps whatever the Strata config chose."),
+                io.Int.Input("startup_timeout", default=900, min=30, max=7200,
+                             tooltip="Seconds to wait for the model to load (first load is slowest)."),
+                io.Int.Input("prompt_timeout", default=1800, min=60, max=7200),
+                # sampling: -1 means "keep whatever strata-<model>.json chose" (the field is then not sent)
+                io.Float.Input("temperature", default=1.0, min=-1.0, max=2.0, step=0.05,
+                               tooltip="Sampling temperature (config default 1.0); -1 keeps the config value."),
+                io.Float.Input("top_p", default=0.95, min=-1.0, max=1.0, step=0.01,
+                               tooltip="Nucleus sampling (config default 0.95); -1 keeps the config value."),
+                io.Int.Input("top_k", default=20, min=-1, max=64,
+                             tooltip="Top-k candidates, engine caps at 64 (config default 20); "
+                                     "-1 keeps the config value."),
+                io.Float.Input("min_p", default=0.0, min=-1.0, max=1.0, step=0.01,
+                               tooltip="Min-p sampling (config default 0.0); -1 keeps the config value."),
+                io.Float.Input("presence_penalty", default=0.0, min=-1.0, max=2.0, step=0.05,
+                               tooltip="Penalise tokens already present (config default 0.0); "
+                                       "-1 keeps the config value."),
+                io.Float.Input("frequency_penalty", default=0.0, min=-1.0, max=2.0, step=0.05,
+                               tooltip="Penalise tokens by how often they appear (config default 0.0); "
+                                       "-1 keeps the config value."),
+                io.Float.Input("repetition_penalty", default=1.05, min=-1.0, max=2.0, step=0.05,
+                               tooltip="Penalise any token seen in the last window (config default 1.05); "
+                                       "-1 keeps the config value."),
+                io.Int.Input("penalty_last_n", default=512, min=-1, max=8192,
+                             tooltip="How many past tokens the penalties look at (default 512; the config "
+                                     "uses 64); -1 keeps the config value."),
+                io.Boolean.Input("unload_after", default=True,
+                                 tooltip="Stop the server and free VRAM/RAM when the prompt finishes."),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffff,
+                             tooltip="Non-zero reuses the cached result instead of loading the model again; "
+                                     "it is also the engine's sampling seed."),
+                io.Boolean.Input("bypass", default=False,
+                                 tooltip="Pass the prompt straight through to the result: Strata is not read, "
+                                         "started, stopped or touched at all."),
+                # Reference pictures mirror LLMTextProcessorVL counts and order so a workflow can feed
+                # the same connections to both nodes; Strata reads image parts only.
+                io.Autogrow.Input("ref_images", optional=True,
+                                  template=io.Autogrow.TemplatePrefix(
+                                      input=io.Image.Input("ref_image"), prefix="ref_image_", min=0, max=9)),
+                io.Image.Input("first_frame", optional=True,
+                               tooltip="First frame; becomes the next Picture only when also_ref_first_frame "
+                                       "is set."),
+                io.Image.Input("last_frame", optional=True,
+                               tooltip="Last frame keyframe pin. Never sent as a Picture to Strata."),
+                io.Boolean.Input("also_ref_first_frame", default=False, advanced=True,
+                                 tooltip="Also expose first_frame as the next Picture reference."),
+            ],
+            outputs=[
+                io.String.Output(display_name="result", tooltip="The assistant text."),
+                io.String.Output(display_name="reasoning",
+                                 tooltip="reasoning_content when the model emits it, otherwise empty."),
+                io.String.Output(display_name="run info",
+                                 tooltip="JSON: model, port, seconds, unload state, token usage."),
+            ],
+        )
+
+    @classmethod
+    def _ordered_pictures(cls, ref_images: dict, first_frame, also_ref_first_frame: bool):
+        # Same order rules as LLMTextProcessorVL._ordered_media, pictures only: socket index first,
+        # then first_frame appended last when also_ref_first_frame asks for it. last_frame is a
+        # keyframe pin in the reference layout and never reaches the model, so it stays unused here.
+        def _by_index(mapping):
+            items = [(int(key.rsplit("_", 1)[-1]), value)
+                     for key, value in mapping.items() if value is not None]
+            return [value for _, value in sorted(items, key=lambda pair: pair[0])]
+
+        pictures = _by_index(ref_images)
+        if also_ref_first_frame and first_frame is not None:
+            # only its first frame joins the Pictures, like the VL node's first_frame[:1]
+            pictures.append(first_frame[:1] if getattr(first_frame, "ndim", 3) == 4 else first_frame)
+        return pictures
+
+    @classmethod
+    def _run(cls, folder, prompt, system, pictures, max_tokens, effort,
              startup_timeout, prompt_timeout, unload, seed, port,
              temperature=-1.0, top_p=-1.0, top_k=-1, min_p=-1.0,
              presence_penalty=-1.0, frequency_penalty=-1.0, repetition_penalty=-1.0,
@@ -534,16 +606,16 @@ class StrataRun:
         messages = []
         if (system or "").strip():
             messages.append({"role": "system", "content": system.strip()})
-        part = _image_part(image) if image is not None else None
-        if part:
+        parts = _picture_parts(pictures)
+        if parts:
             if not cfg.get("vision"):
                 raise ValueError("this Strata install has no vision configured")
             messages.append({"role": "user",
-                             "content": [part, {"type": "text",
-                                                "text": (prompt or "").strip()}]})
+                             "content": parts + [{"type": "text",
+                                                  "text": (prompt or "").strip()}]})
         else:
             messages.append({"role": "user", "content": (prompt or "").strip()})
-        if not (prompt or "").strip() and not part:
+        if not (prompt or "").strip() and not parts:
             raise ValueError("the prompt is empty")
         # -1 in a sampling widget means "leave the config value alone": the field is not sent,
         # so serve/server.py keeps strata-<model>.json's own number for it
@@ -570,45 +642,62 @@ class StrataRun:
                      else "left running")
         meta = {"model": info.get("model"), "port": port, "loaded": True,
             "seconds": round(time.time() - t0, 1), "unload": state, "usage": usage,
-            "stopped_existing_server": stopped}
+            "pictures": len(parts), "stopped_existing_server": stopped}
         return (content, reasoning, json.dumps(meta, indent=2))
 
-    def execute(self, folder: str, port: int, prompt: str, system: str = "",
+    @classmethod
+    def execute(cls, folder: str, port: int, prompt: str, system: str = "",
               max_tokens: int = 4096, thinking: str = "config",
               startup_timeout: int = 900, prompt_timeout: int = 1800,
               temperature: float = 1.0, top_p: float = 0.95, top_k: int = 20, min_p: float = 0.0,
               presence_penalty: float = 0.0, frequency_penalty: float = 0.0,
               repetition_penalty: float = 1.05, penalty_last_n: int = 512,
-              unload_after: bool = True, seed: int = 0, bypass: bool = False, image=None):
-        # the order here must match INPUT_TYPES exactly: ComfyUI calls this positionally, so
-        # the eight sampling widgets sit between prompt_timeout and unload_after; bypass is a
-        # required widget just before the only optional input (image), which must stay last
-        key = (folder, prompt, system, max_tokens, thinking, image is not None, port,
+              unload_after: bool = True, seed: int = 0, bypass: bool = False,
+              ref_images: dict | None = None, first_frame=None, last_frame=None,
+              also_ref_first_frame: bool = False):
+        # new-API nodes are called by keyword, so this signature no longer has to shadow the
+        # schema order; media references come in as one autogrow dict plus the frame pins
+        pictures = cls._ordered_pictures(ref_images or {}, first_frame, also_ref_first_frame)
+        # only a non-zero seed can reuse a result, so the pictures are fingerprinted just then -
+        # hashing them every time would copy every tensor to the CPU on each execution
+        media = _media_digest(pictures) if seed else None
+        key = (folder, prompt, system, max_tokens, thinking, media, port,
                startup_timeout, prompt_timeout, unload_after, seed, bypass,
                temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty,
                repetition_penalty, penalty_last_n)
-        if seed and key in self.cache:
-            return self.cache[key]
-        out = self._run(folder, prompt, system, image, max_tokens,
+        if seed and key in _RESULT_CACHE:
+            return io.NodeOutput(*_RESULT_CACHE[key])
+        out = cls._run(folder, prompt, system, pictures, max_tokens,
                         "" if thinking == "config" else thinking, startup_timeout,
                         prompt_timeout, unload_after, seed, port, temperature, top_p, top_k,
                         min_p, presence_penalty, frequency_penalty, repetition_penalty,
-                        penalty_last_n, bypass)
-        self.cache = {key: out}
-        return out
+                       penalty_last_n, bypass)
+        _RESULT_CACHE.clear()
+        _RESULT_CACHE[key] = out
+        return io.NodeOutput(*out)
 
 
-class StrataInspect:
-    def INPUT_TYPES(s=None):
-        return {"required": {"folder": ("STRING", {"multiline": False,
-                                                   "tooltip": "The configured Strata folder."})}}
+class StrataInspect(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="StrataInspect",
+            display_name="Strata Config",
+            description="A folder path in, the parsed config and exact start command out. "
+                        "No GPU work: nothing is started or stopped.",
+            category="LLM/Strata",
+            inputs=[
+                io.String.Input("folder", multiline=False,
+                                tooltip="The configured Strata folder."),
+            ],
+            outputs=[
+                io.String.Output(display_name="config info"),
+                io.String.Output(display_name="start command"),
+            ],
+        )
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("config info", "start command")
-    FUNCTION = "execute"
-    CATEGORY = "LLM/Strata"
-
-    def execute(self, folder: str):
+    @classmethod
+    def execute(cls, folder: str):
         cfg = _load_config(folder)
         (py, server_py), extra = _read_run_bat(cfg)
         cmd = " ".join([py, server_py, "--engine", "strata",
@@ -620,14 +709,9 @@ class StrataInspect:
                 cfg.get("reasoning_effort"), "sampling": cfg.get("sampling"),
                 "engine_exe": cfg.get("exe"), "start_command": cmd,
                 "server_running": bool(h and h.get("loaded"))}
-        return (json.dumps(info, indent=2), cmd)
+        return io.NodeOutput(json.dumps(info, indent=2), cmd)
 
 
-NODE_CLASS_MAPPINGS = {
-    "StrataRun": StrataRun,
-    "StrataInspect": StrataInspect,
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "StrataRun": "Strata Run (start / prompt / stop)",
-    "StrataInspect": "Strata Config",
-}
+class StrataExtension(ComfyExtension):
+    async def get_node_list(self):
+        return [StrataRun, StrataInspect]
